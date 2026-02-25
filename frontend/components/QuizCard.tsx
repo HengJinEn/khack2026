@@ -1,39 +1,34 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-
-export interface QuizQuestion {
-  id: string;
-  videoUrl: string;
-  videoId: string;
-  question: string;
-  options: string[];
-  correctAnswer: number;
-}
+import type { Scene } from './StoryBook';
 
 interface QuizCardProps {
-  questions: QuizQuestion[];
+  scenes: Scene[];
   currentPageIndex: number;
+  character: string;
   onAnswer: (isCorrect: boolean) => void;
   onFlip: () => void;
   canFlip: boolean;
+  isLastPage: boolean;
 }
 
 export default function QuizCard({
-  questions,
+  scenes,
   currentPageIndex,
+  character,
   onAnswer,
   onFlip,
   canFlip,
+  isLastPage,
 }: QuizCardProps) {
   const [selectedAnswer, setSelectedAnswer] = useState<number | null>(null);
   const [answered, setAnswered] = useState(false);
   const [isCorrect, setIsCorrect] = useState(false);
 
-  const currentQuestion = questions[currentPageIndex];
+  const currentScene = scenes[currentPageIndex];
 
   useEffect(() => {
-    // Reset state when moving to new question
     setSelectedAnswer(null);
     setAnswered(false);
     setIsCorrect(false);
@@ -43,101 +38,117 @@ export default function QuizCard({
     if (answered) return;
 
     setSelectedAnswer(optionIndex);
-    const correct = optionIndex === currentQuestion.correctAnswer;
+    const correct = optionIndex === currentScene.correctAnswer;
     setIsCorrect(correct);
     setAnswered(true);
     onAnswer(correct);
   };
 
   return (
-    <div className="w-full h-full flex flex-col md:flex-row gap-8 p-8 bg-gradient-to-br from-amber-50 to-orange-50 rounded-3xl shadow-2xl">
+    <div className="w-full h-full flex flex-col justify-between">
+      {/* Audio Script — same style as NarrativePanel */}
+      <div>
+        <div className="relative">
+          <span className="absolute -top-4 -left-2 text-6xl text-amber-300/40 font-serif leading-none select-none">"</span>
+          <div className="bg-gradient-to-br from-amber-50/80 to-orange-50/60 rounded-2xl p-6 border border-amber-200/50 shadow-inner">
+            <p className="text-lg leading-relaxed text-[#3e2723] font-medium italic narrative-fade-in">
+              {currentScene.dialogue}
+            </p>
+          </div>
+          <span className="absolute -bottom-6 right-2 text-6xl text-amber-300/40 font-serif leading-none select-none rotate-180">"</span>
+        </div>
+
+        {/* Narrator label */}
+        <div className="mt-8 flex items-center gap-2">
+          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-amber-300 to-transparent" />
+          <span className="text-sm font-semibold text-amber-600/80 tracking-wider uppercase">
+            — {character}
+          </span>
+          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-amber-300 to-transparent" />
+        </div>
+      </div>
 
       {/* Quiz Section */}
-      <div className="flex-1 flex flex-col justify-between">
-        {/* Question */}
-        <div>
-          <h3 className="text-2xl font-bold text-gray-800 mb-6">{currentQuestion.question}</h3>
+      <div className="mt-6">
+        <h3 className="text-lg font-bold text-gray-800 mb-3">{currentScene.question}</h3>
 
-          {/* Answer Options */}
-          <div className="grid grid-cols-1 gap-3">
-            {currentQuestion.options.map((option, index) => (
-              <button
-                key={index}
-                onClick={() => handleAnswerSubmit(index)}
-                disabled={answered}
-                className={`p-4 rounded-xl border-3 font-semibold text-left transition-all transform ${
-                  selectedAnswer === index
-                    ? isCorrect
-                      ? 'border-green-500 bg-green-200 text-green-900 scale-105'
-                      : 'border-red-500 bg-red-200 text-red-900 scale-105'
-                    : answered && index === currentQuestion.correctAnswer
-                    ? 'border-green-500 bg-green-100 text-green-800'
-                    : 'border-gray-300 bg-white text-gray-700 hover:border-blue-400 hover:bg-blue-50'
+        {/* 2x2 Answer Grid */}
+        <div className="grid grid-cols-2 gap-2">
+          {currentScene.options?.map((option, index) => (
+            <button
+              key={index}
+              onClick={() => handleAnswerSubmit(index)}
+              disabled={answered}
+              className={`p-3 rounded-xl border-2 font-semibold text-sm text-left transition-all transform ${selectedAnswer === index
+                ? isCorrect
+                  ? 'border-green-500 bg-green-200 text-green-900 scale-105'
+                  : 'border-red-500 bg-red-200 text-red-900 scale-105'
+                : answered && index === currentScene.correctAnswer
+                  ? 'border-green-500 bg-green-100 text-green-800'
+                  : 'border-gray-300 bg-white text-gray-700 hover:border-blue-400 hover:bg-blue-50'
                 } ${answered ? 'cursor-default' : 'hover:cursor-pointer hover:scale-102'}`}
-              >
-                <div className="flex items-center">
-                  <div className="w-6 h-6 rounded-full border-2 border-current mr-3 flex items-center justify-center">
-                    {selectedAnswer === index && <div className="w-3 h-3 rounded-full bg-current" />}
-                  </div>
-                  {option}
+            >
+              <div className="flex items-center">
+                <div className="w-5 h-5 rounded-full border-2 border-current mr-2 flex items-center justify-center flex-shrink-0">
+                  {selectedAnswer === index && <div className="w-2.5 h-2.5 rounded-full bg-current" />}
                 </div>
-              </button>
-            ))}
-          </div>
+                {option}
+              </div>
+            </button>
+          ))}
         </div>
 
-        {/* Feedback and Action Buttons */}
-        <div className="mt-8 pt-6 border-t-2 border-gray-300">
-          {answered && (
-            <div className="mb-4">
-              {isCorrect ? (
-                <div className="p-4 bg-green-100 border-2 border-green-500 rounded-lg">
-                  <p className="text-green-800 font-bold text-lg">Correct! Great job!</p>
-                </div>
-              ) : (
-                <div className="p-4 bg-red-100 border-2 border-red-500 rounded-lg">
-                  <p className="text-red-800 font-bold text-lg">
-                    Not quite right. The correct answer is: {currentQuestion.options[currentQuestion.correctAnswer]}
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Action Buttons */}
-          <div className="flex gap-4">
-            {!answered ? (
-              <button
-                disabled
-                className="flex-1 py-3 px-6 rounded-xl bg-gray-300 text-gray-600 font-bold cursor-not-allowed"
-              >
-                Answer a question to continue
-              </button>
-            ) : isCorrect ? (
-              <button
-                onClick={onFlip}
-                disabled={!canFlip}
-                className={`flex-1 py-3 px-6 rounded-xl font-bold text-lg transition-all transform ${
-                  canFlip
-                    ? 'border-2 border-blue-500 bg-blue-500 text-white hover:bg-blue-600 hover:scale-105 cursor-pointer'
-                    : 'border-2 border-gray-400 bg-gray-300 text-gray-600 cursor-not-allowed'
-                }`}
-              >
-                Flip
-              </button>
+        {/* Feedback */}
+        {answered && (
+          <div className="mt-3">
+            {isCorrect ? (
+              <div className="p-3 bg-green-100 border-2 border-green-500 rounded-lg">
+                <p className="text-green-800 font-bold">✅ Correct! Great job!</p>
+              </div>
             ) : (
-              <button
-                onClick={() => {
-                  setSelectedAnswer(null);
-                  setAnswered(false);
-                }}
-                className="flex-1 py-3 px-6 rounded-xl border-2 border-orange-500 bg-orange-500 text-white hover:bg-orange-600 font-bold text-lg transition-all transform hover:scale-105 cursor-pointer"
-              >
-                Retry
-              </button>
+              <div className="p-3 bg-red-100 border-2 border-red-500 rounded-lg">
+                <p className="text-red-800 font-bold text-sm">
+                  Not quite right. The correct answer is: {currentScene.options?.[currentScene.correctAnswer ?? 0]}
+                </p>
+              </div>
             )}
           </div>
-        </div>
+        )}
+      </div>
+
+      {/* Action Button */}
+      <div className="mt-4 pt-4 border-t-2 border-gray-200">
+        {!answered ? (
+          <button
+            disabled
+            className="w-full py-3 px-6 rounded-xl bg-gray-300 text-gray-500 font-bold cursor-not-allowed"
+          >
+            Answer a question to continue
+          </button>
+        ) : isCorrect ? (
+          <button
+            onClick={onFlip}
+            disabled={!canFlip}
+            className={`w-full py-3 px-6 rounded-xl font-bold text-lg transition-all transform ${canFlip
+              ? isLastPage
+                ? 'bg-gradient-to-r from-green-500 to-emerald-600 text-white hover:from-green-600 hover:to-emerald-700 hover:scale-[1.02] shadow-lg cursor-pointer'
+                : 'bg-gradient-to-r from-blue-500 to-indigo-600 text-white hover:from-blue-600 hover:to-indigo-700 hover:scale-[1.02] shadow-lg cursor-pointer'
+              : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+              }`}
+          >
+            {isLastPage ? '✨ Complete Story!' : 'Next Page →'}
+          </button>
+        ) : (
+          <button
+            onClick={() => {
+              setSelectedAnswer(null);
+              setAnswered(false);
+            }}
+            className="w-full py-3 px-6 rounded-xl border-2 border-orange-500 bg-orange-500 text-white hover:bg-orange-600 font-bold text-lg transition-all transform hover:scale-[1.02] cursor-pointer"
+          >
+            Retry
+          </button>
+        )}
       </div>
     </div>
   );

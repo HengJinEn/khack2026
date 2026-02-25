@@ -69,3 +69,19 @@ body {
   transform-origin: left center;
   backface-visibility: hidden;
 }
+
+/* Narrative text fade-in */
+@keyframes narrativeFadeIn {
+  0% {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.narrative-fade-in {
+  animation: narrativeFadeIn 0.6s ease-out forwards;
+}
