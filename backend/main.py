@@ -225,7 +225,6 @@ async def generate_episode_endpoint(
             "error": None,
         }
 
-
         background_tasks.add_task(
             _generate_episode_background,
             episode_id,
