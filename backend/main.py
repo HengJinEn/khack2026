@@ -225,25 +225,7 @@ async def generate_episode_endpoint(
             "error": None,
         }
 
-        if os.environ.get("MOCK_MODE", "false").lower() == "true":
-            # In mock mode, generate immediately and don't use background tasks
-            # so the frontend doesn't even have to poll for long
-            _generate_episode_background(
-                episode_id,
-                episode_topic,
-                story_style,
-                character_image_base64,
-                character_name,
-            )
-            return GenerateEpisodeResponse(
-                success=True,
-                episode={
-                    "episode_id": episode_id,
-                    "status": "complete",
-                    "message": "Mock episode generated instantly.",
-                },
-            )
-            
+
         background_tasks.add_task(
             _generate_episode_background,
             episode_id,
