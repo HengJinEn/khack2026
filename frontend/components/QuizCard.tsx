@@ -26,6 +26,37 @@ export default function QuizCard({
   const [answered, setAnswered] = useState(false);
   const [isCorrect, setIsCorrect] = useState(false);
 
+  const playSound = (type: 'correct' | 'wrong') => {
+    try {
+      const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      const now = audioContext.currentTime;
+      const osc = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      osc.connect(gain);
+      gain.connect(audioContext.destination);
+
+      if (type === 'correct') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(400, now);
+        osc.frequency.exponentialRampToValueAtTime(800, now + 0.1);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+        osc.start(now);
+        osc.stop(now + 0.3);
+      } else {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(150, now);
+        osc.frequency.exponentialRampToValueAtTime(100, now + 0.2);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+        osc.start(now);
+        osc.stop(now + 0.3);
+      }
+    } catch {
+      // silently ignore
+    }
+  };
+
   const currentScene = scenes[currentPageIndex];
 
   useEffect(() => {
@@ -41,6 +72,10 @@ export default function QuizCard({
     const correct = optionIndex === currentScene.correctAnswer;
     setIsCorrect(correct);
     setAnswered(true);
+
+    // Play sound effect
+    playSound(correct ? 'correct' : 'wrong');
+
     onAnswer(correct);
   };
 
@@ -107,9 +142,7 @@ export default function QuizCard({
               </div>
             ) : (
               <div className="p-3 bg-red-100 border-2 border-red-500 rounded-lg">
-                <p className="text-red-800 font-bold text-sm">
-                  Not quite right. The correct answer is: {currentScene.options?.[currentScene.correctAnswer ?? 0]}
-                </p>
+                <p className="text-red-800 font-bold text-sm">❌ Incorrect! Please try again.</p>
               </div>
             )}
           </div>

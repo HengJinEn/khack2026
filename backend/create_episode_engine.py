@@ -5,111 +5,262 @@ Uses Gemini 3 Pro with thinking levels to orchestrate episode generation.
 
 import json
 import os
-import requests
+import time
+import base64
+import tempfile
+import subprocess
+import uuid
+import logging
 from typing import Dict, List, Any, Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except Exception:
+    pass
+
 from google import genai
 from google.genai import types
-import base64
+from google.genai.types import VideoGenerationReferenceImage
+from google.cloud import storage
 
-GEMINI_3_MODEL = "gemini-3-pro-preview"
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+GEMINI_MODEL = "gemini-3-pro-preview"
+
 MAX_VALIDATION_RETRIES = 3
 
 REQUIRED_SCENE_COUNT = 8
 INTERACTIVE_SCENE_INDICES = {2, 4, 6}
 NON_INTERACTIVE_SCENE_INDICES = {1, 3, 5, 7, 8}
 
-VEO_GENERATION_ENDPOINT = os.getenv("VEO_GENERATION_ENDPOINT", "https://veo-service-528610678511.us-central1.run.app/generate-episode")
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "khack2026")
+LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+BUCKET_NAME = os.environ.get("VEO_BUCKET", "veo-video-gen-interactive-episodes")
+VIDEO_MODEL = os.environ.get("VEO_MODEL", "veo-3.0-generate-preview")
+
+# Global style + voice policies (applied to every Veo prompt)
+DEFAULT_NEGATIVE_PROMPT = (
+    "logos, watermarks, text overlays, harsh tone, deep voice, scary mood, "
+    "realistic humans, violence, dark lighting, horror, adult themes"
+)
+GLOBAL_VOICE_PROMPT = (
+    "Use a cartoon-style friendly, warm, and expressive voice. "
+    "Use SAME VOICE across all scenes. "
+    "Tone should be light, energetic, and natural with clear articulation. "
+    "Avoid deep, harsh, monotone, robotic, or overly dramatic delivery."
+)
+GLOBAL_STYLE_PROMPT = (
+    "High-quality 3D animated cartoon style with vibrant color palette and bright lighting. "
+    "Expressive character acting and clear facial expressions. "
+    "Smooth, lively motion and clean composition with gentle depth of field.\n\n"
+    "CRITICAL CHARACTER CONSISTENCY REQUIREMENTS:\n"
+    "- The main character MUST match the provided reference image EXACTLY across ALL scenes\n"
+    "- NO redesign, reinterpretation, or variation of the character\n"
+    "- Keep IDENTICAL: face shape, eyes, mouth, fur/skin tone, markings, outfit, accessories, proportions, and style\n"
+    "- Character appearance must be perfectly consistent from scene to scene\n"
+    "\n"
+    "Add light, upbeat instrumental background music at a low volume under the dialogue."
+)
 
 
-def validate_episode_schema(episode_data: Dict[str, Any]) -> tuple[bool, List[str]]:
+# ---------------------------------------------------------------------------
+# GCS / Video Utilities
+# ---------------------------------------------------------------------------
+
+def _gcs_client() -> storage.Client:
+    return storage.Client(project=PROJECT_ID)
+
+
+def _get_signed_url(bucket_name: str, blob_name: str, expires_seconds: int = 3600) -> str:
+    from google.oauth2 import service_account
+    from datetime import timedelta
+    credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if credentials_path and os.path.exists(credentials_path):
+        credentials = service_account.Credentials.from_service_account_file(credentials_path)
+        client = storage.Client(project=PROJECT_ID, credentials=credentials)
+    else:
+        client = _gcs_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    return blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(seconds=expires_seconds),
+        method="GET",
+    )
+
+
+def _gcs_object_name_from_uri(gcs_uri: str) -> str:
+    gs_prefix = f"gs://{BUCKET_NAME}/"
+    if gcs_uri.startswith(gs_prefix):
+        return gcs_uri[len(gs_prefix):]
+    https_prefix = f"https://storage.googleapis.com/{BUCKET_NAME}/"
+    if gcs_uri.startswith(https_prefix):
+        return gcs_uri[len(https_prefix):].split("?")[0]
+    # Generic gs:// handling
+    if gcs_uri.startswith("gs://"):
+        parts = gcs_uri.replace("gs://", "").split("/", 1)
+        if len(parts) == 2:
+            return parts[1]
+    raise ValueError(f"Unexpected GCS URI: {gcs_uri[:100]}")
+
+
+def _build_veo_prompt(scene_prompt: str, dialogue: Optional[str]) -> str:
+    parts = [scene_prompt, f"Global style rules: {GLOBAL_STYLE_PROMPT}"]
+    if dialogue:
+        parts.append(f'Spoken dialogue: "{dialogue}"')
+    parts.append(f"Voice style rules: {GLOBAL_VOICE_PROMPT}")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Veo Video Generation (in-process, no HTTP call)
+# ---------------------------------------------------------------------------
+
+def _generate_single_video(
+    client: genai.Client,
+    prompt: str,
+    image_part,
+    config_params: dict,
+    label: str = "video",
+) -> str:
+    """Generate one video via Veo SDK and return its GCS URI."""
+    print(f"[Veo] Generating {label}...")
+    operation = client.models.generate_videos(
+        model=VIDEO_MODEL,
+        prompt=prompt,
+        image=image_part,
+        config=types.GenerateVideosConfig(**config_params),
+    )
+    poll_count = 0
+    while not operation.done:
+        time.sleep(8)
+        poll_count += 1
+        if poll_count % 10 == 0:
+            print(f"[Veo] Still waiting for {label}... ({poll_count * 8}s elapsed)")
+        operation = client.operations.get(operation)
+
+    if not operation.result or not operation.result.generated_videos:
+        raise RuntimeError(f"Veo failed to generate {label}: {getattr(operation, 'error', 'unknown error')}")
+
+    uri = operation.result.generated_videos[0].video.uri
+    print(f"[Veo] {label} ready: {uri}")
+    return uri
+
+
+def generate_videos_for_episode(
+    episode_data: Dict[str, Any],
+    character_image_base64: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Validates that the episode JSON matches the required schema.
-    Returns (is_valid, list_of_errors).
+    Generate Veo videos in-process for every scene in the episode.
+    Populates video_url only (no feedback or idle clips).
     """
+    veo_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+    episode_id = episode_data.get("episode_id", f"ep_{int(time.time())}_{uuid.uuid4().hex[:8]}")
+
+    # Prepare character reference image (asset reference for character consistency)
+    asset_reference_config = None
+    temp_asset_ref_path = None
+    if character_image_base64:
+        print("[Veo] Processing character reference image...")
+        asset_ref_bytes = base64.b64decode(character_image_base64)
+        fd, temp_asset_ref_path = tempfile.mkstemp(suffix="_asset_ref.png")
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(asset_ref_bytes)
+        asset_reference_config = VideoGenerationReferenceImage(
+            image=types.Image.from_file(location=temp_asset_ref_path),
+            reference_type="asset",
+        )
+
+
+    for idx, scene in enumerate(episode_data["scenes"]):
+        scene_num = scene["scene_number"]
+        print(f"[Veo] Processing scene {scene_num}/{len(episode_data['scenes'])}...")
+
+        final_prompt = _build_veo_prompt(scene["prompt"], scene.get("dialogue"))
+
+        config_params: Dict[str, Any] = {
+            "aspect_ratio": "16:9",
+            "number_of_videos": 1,
+            "duration_seconds": 8,
+            "generate_audio": True,
+            "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
+            "output_gcs_uri": f"gs://{BUCKET_NAME}/episodes/{episode_id}/scenes/scene_{scene_num}",
+        }
+        if asset_reference_config:
+            config_params["reference_images"] = [asset_reference_config]
+
+        scene_uri = _generate_single_video(
+            veo_client, final_prompt, None, config_params, label=f"scene_{scene_num}"
+        )
+
+        # Update scene with real video URL (signed)
+        scene["video_url"] = _get_signed_url(BUCKET_NAME, _gcs_object_name_from_uri(scene_uri))
+
+    # Cleanup temp files
+    if temp_asset_ref_path and os.path.exists(temp_asset_ref_path):
+        os.remove(temp_asset_ref_path)
+
+    print(f"[Pipeline] All videos generated. Episode: {episode_id} scene {scene_num}")
+    return episode_data
+
+
+# ---------------------------------------------------------------------------
+# Schema Validation
+# ---------------------------------------------------------------------------
+
+def validate_episode_schema(episode_data: Dict[str, Any]) -> tuple:
     errors = []
-    
-    # Check required top-level fields
     required_fields = ["episode_id", "title", "description", "skills", "scenes"]
     for field in required_fields:
         if field not in episode_data:
             errors.append(f"Missing required field: {field}")
-    
-    # Check scenes
+
     if "scenes" not in episode_data:
-        errors.append("Missing 'scenes' field")
         return False, errors
-    
+
     scenes = episode_data["scenes"]
-    
-    # Check scene count
     if len(scenes) != REQUIRED_SCENE_COUNT:
         errors.append(f"Expected {REQUIRED_SCENE_COUNT} scenes, got {len(scenes)}")
-    
-    # Validate each scene
+
     for i, scene in enumerate(scenes, start=1):
         scene_num = scene.get("scene_number", i)
-        
-        # Check required fields for all scenes
         required_scene_fields = ["scene_number", "interaction", "video_url", "prompt", "dialogue"]
         for field in required_scene_fields:
             if field not in scene:
                 errors.append(f"Scene {scene_num}: Missing required field '{field}'")
-        
-        # Check interaction flag
+
         is_interactive = scene.get("interaction", False)
         should_be_interactive = scene_num in INTERACTIVE_SCENE_INDICES
-        
         if is_interactive != should_be_interactive:
-            errors.append(
-                f"Scene {scene_num}: interaction should be {should_be_interactive}, got {is_interactive}"
-            )
-        
-        # Validate interactive scenes have required fields
+            errors.append(f"Scene {scene_num}: interaction should be {should_be_interactive}, got {is_interactive}")
+
         if is_interactive:
-            interactive_fields = [
-                "interaction_type", "question", "options", "correct_answer_index",
-                "correct_feedback_url", "incorrect_feedback_url", "idle_url"
-            ]
-            for field in interactive_fields:
+            for field in ["interaction_type", "question", "options", "correct_answer_index"]:
                 if field not in scene:
                     errors.append(f"Scene {scene_num}: Interactive scene missing '{field}'")
-            
-            # Validate options has exactly 4 items
             if "options" in scene:
                 if not isinstance(scene["options"], list) or len(scene["options"]) != 4:
                     errors.append(f"Scene {scene_num}: 'options' must be a list of exactly 4 items")
-            
-            # Validate correct_answer_index is 0-3
             if "correct_answer_index" in scene:
                 idx = scene["correct_answer_index"]
                 if not isinstance(idx, int) or idx < 0 or idx > 3:
                     errors.append(f"Scene {scene_num}: 'correct_answer_index' must be 0-3")
-        
-        # Validate non-interactive scenes don't have interaction-only fields
-        if not is_interactive:
-            forbidden_fields = [
-                "interaction_type", "question", "options", "correct_answer_index",
-                "correct_feedback_url", "incorrect_feedback_url", "idle_url"
-            ]
-            for field in forbidden_fields:
-                if field in scene:
-                    errors.append(
-                        f"Scene {scene_num}: Non-interactive scene should not have '{field}'"
-                    )
-    
+
     return len(errors) == 0, errors
 
 
+# ---------------------------------------------------------------------------
+# Gemini Clients + Episode Plan
+# ---------------------------------------------------------------------------
+
 def get_gemini_client() -> genai.Client:
-    """Initialize and return Gemini client with Vertex AI authentication."""
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "toonlabs")
-    location = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
-    
-    return genai.Client(
-        vertexai=True,
-        project=project_id,
-        location=location
-    )
+    return genai.Client(vertexai=True, project=PROJECT_ID, location="global")
 
 
 def generate_episode_plan(
@@ -118,11 +269,8 @@ def generate_episode_plan(
     story_style: str,
     character_description: Optional[str] = None
 ) -> Dict[str, Any]:
-    """
-    Phase A: Generate complete episode plan using HIGH thinking level.
-    Returns a structured episode outline with all 8 scenes.
-    """
-    
+    """Phase A: Generate complete 8-scene episode plan using Gemini with HIGH thinking."""
+
     reference_episode = '''
 {
   "episode_id": "ecology_explorers_photosynthesis",
@@ -134,7 +282,7 @@ def generate_episode_plan(
       "scene_number": 1,
       "interaction": false,
       "video_url": "gs://placeholder/scene1.mp4",
-      "prompt": "Cinematic 2D storybook-style outdoor ecology learning lab. Include a wooden field table, plant pots, magnifying glass, and subtle observation tools with NO readable text. Foreground features one clearly drooping plant with pale leaves. Lumi the Bunny kneels beside it, gently lifting a leaf with concern. Warm morning sunlight, soft shadows, strong depth.",
+      "prompt": "Cinematic 2D storybook-style outdoor ecology lab. Lumi the Bunny kneels beside a drooping plant, gently lifting a leaf. Warm morning sunlight, NO readable text.",
       "dialogue": "Oh no… this little plant is tired. Have you ever wondered how plants make their food?"
     },
     {
@@ -142,9 +290,6 @@ def generate_episode_plan(
       "interaction": true,
       "interaction_type": "quiz",
       "video_url": "gs://placeholder/scene2.mp4",
-      "correct_feedback_url": "gs://placeholder/scene2_correct.mp4",
-      "incorrect_feedback_url": "gs://placeholder/scene2_incorrect.mp4",
-      "idle_url": "gs://placeholder/scene2_idle.mp4",
       "prompt": "Same outdoor ecology lab. Lumi stands front and center, thinking and curious about plants. Background shows various potted plants at different stages of growth. Lighting is bright and encouraging. No readable text anywhere.",
       "dialogue": "Plants need three things to make their food. Do you remember what sunlight does?",
       "question": "What does sunlight help plants do?",
@@ -154,8 +299,7 @@ def generate_episode_plan(
   ]
 }
 '''
-    
-    # Build the prompt for episode planning
+
     planning_prompt = f"""
 You are an expert educational content designer creating interactive episodes for children.
 
@@ -164,7 +308,7 @@ USER REQUEST:
 - Story Style: {story_style}
 {f"- Character: {character_description}" if character_description else ""}
 
-REFERENCE EPISODE (for schema and style guidance):
+REFERENCE EPISODE (schema and style guide):
 {reference_episode}
 
 CRITICAL REQUIREMENTS:
@@ -190,10 +334,10 @@ You must generate a complete episode JSON that follows this EXACT structure and 
 
 2. EPISODE STRUCTURE (NON-NEGOTIABLE):
    - Exactly 8 scenes
-   - Scenes 2, 4, and 6 have interaction checkpoints
-   - Scenes 1, 3, 5, 7, and 8 are non-interactive
+   - Scenes 2, 4, 6 → interaction: true (quiz MCQ)
+   - Scenes 1, 3, 5, 7, 8 → interaction: false
 
-2. SCENE PURPOSE BY INDEX:
+3. SCENE PURPOSE BY INDEX:
    - Scene 1: Introduce the main concept (non-interactive)
    - Scene 2: First interaction checkpoint (INTERACTIVE)
    - Scene 3: Deepen understanding (non-interactive)
@@ -203,12 +347,12 @@ You must generate a complete episode JSON that follows this EXACT structure and 
    - Scene 7: Connect to real-world application (non-interactive)
    - Scene 8: Celebrate learning and recap (non-interactive)
 
-3. REQUIRED JSON SCHEMA:
+4. REQUIRED JSON SCHEMA:
 {{
-  "episode_id": "unique_id_based_on_content",
+  "episode_id": "unique_id",
   "title": "Episode Title",
-  "description": "Brief description of the episode",
-  "skills": ["Skill1", "Skill2", "Skill3"],
+  "description": "[Character Name] explores [topic]",
+  "skills": ["Skill1", "Skill2"],
   "scenes": [
     {{
       "scene_number": 1,
@@ -222,9 +366,6 @@ You must generate a complete episode JSON that follows this EXACT structure and 
       "interaction": true,
       "interaction_type": "quiz",
       "video_url": "gs://placeholder/scene2.mp4",
-      "correct_feedback_url": "gs://placeholder/scene2_correct.mp4",
-      "incorrect_feedback_url": "gs://placeholder/scene2_incorrect.mp4",
-      "idle_url": "gs://placeholder/scene2_idle.mp4",
       "prompt": "Detailed Veo video generation prompt",
       "dialogue": "What the character asks/says",
       "question": "The question to ask the child",
@@ -235,7 +376,7 @@ You must generate a complete episode JSON that follows this EXACT structure and 
   ]
 }}
 
-4. DIALOGUE REQUIREMENTS (CRITICAL - MUST FOLLOW EXACTLY):
+5. DIALOGUE REQUIREMENTS (CRITICAL - MUST FOLLOW EXACTLY):
    ⚠️ HARD CONSTRAINT: All dialogue must be concise and speakable within 6-8 seconds maximum.
    
    Style Guidelines:
@@ -252,7 +393,7 @@ You must generate a complete episode JSON that follows this EXACT structure and 
    ❌ "Today we are going to learn several important ways to conserve electrical power…"
    ❌ "Now I want you to think carefully about all the different types of…"
 
-5. INTERACTION DESIGN FRAMEWORK (CRITICAL - DEMONSTRATE-EXPLAIN-TRANSFER):
+6. INTERACTION DESIGN FRAMEWORK (CRITICAL - DEMONSTRATE-EXPLAIN-TRANSFER):
    
    ⚠️ PEDAGOGICAL STRUCTURE - Follow this 3-step learning pattern:
    
@@ -312,7 +453,7 @@ You must generate a complete episode JSON that follows this EXACT structure and 
    • Scene 4: Application of concept to new situation
    • Scene 6: Synthesis/deeper understanding or real-world application
 
-6. VEO PROMPT GUIDELINES:
+7. VEO PROMPT GUIDELINES:
    - Each prompt should be detailed and specific for video generation
    - Maintain visual consistency across scenes
    - Include character actions, environment, and key visual elements
@@ -368,7 +509,7 @@ Generate the complete 8-scene episode JSON now. Think carefully about the educat
 """
 
     response = client.models.generate_content(
-        model=GEMINI_3_MODEL,
+        model=GEMINI_MODEL,
         contents=planning_prompt,
         config=types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(
@@ -378,14 +519,8 @@ Generate the complete 8-scene episode JSON now. Think carefully about the educat
             response_mime_type="application/json",
         ),
     )
-    
-    episode_json = json.loads(response.text)
-    return episode_json
+    return json.loads(response.text)
 
-
-# ------------------------------------------------------------------------------
-# Phase B: Scene Expansion (Mixed thinking levels)
-# ------------------------------------------------------------------------------
 
 def expand_scene(
     client: genai.Client,
@@ -393,14 +528,9 @@ def expand_scene(
     episode_context: Dict[str, Any],
     thinking_level: str
 ) -> Dict[str, Any]:
-    """
-    Expand a scene stub into a complete scene with proper fields.
-    Uses specified thinking level (HIGH for interactive, LOW for non-interactive).
-    """
-    
+    """Expand a scene stub into a fuller scene with detailed Veo prompt."""
     scene_num = scene_stub.get("scene_number")
     is_interactive = scene_stub.get("interaction", False)
-    
     expansion_prompt = f"""
 You are refining scene {scene_num} of an educational episode.
 
@@ -422,11 +552,9 @@ CHARACTER CONSISTENCY (CRITICAL - MUST FOLLOW):
 TASK:
 {"INTERACTIVE SCENE (MCQ QUIZ) - " if is_interactive else "NON-INTERACTIVE SCENE - "}
 Enhance this scene with:
-1. A detailed, specific Veo video generation prompt (200-300 words)
-2. Engaging, age-appropriate dialogue (CRITICAL: must be speakable within 6-8 seconds maximum)
-{"3. A clear multiple-choice question" if is_interactive else ""}
-{"4. Four answer options (always exactly 4)" if is_interactive else ""}
-{"5. The correct answer index (0-3)" if is_interactive else ""}
+1. A detailed Veo video generation prompt (150-250 words)
+2. Concise, warm dialogue (6-8 seconds max when spoken)
+{"3. Clear MCQ question, 4 options, correct_answer_index (0-3)" if is_interactive else ""}
 
 DIALOGUE REQUIREMENTS (MUST FOLLOW):
 ⚠️ HARD CONSTRAINT: All dialogue must be concise and speakable within 6-8 seconds maximum.
@@ -453,15 +581,16 @@ Examples:
 {"Dialogue should naturally set up the quiz without revealing the answer." if is_interactive else ""}
 {"" if is_interactive else ""}
 {"Examples:" if is_interactive else ""}
-{"✅ dialogue: 'Can you help me pick the right answer? What happens when plants get sunlight?'" if is_interactive else ""}
+{"✅ dialogue: 'It's cloudy today! The plants cannot grow. Do you know why they need it?'" if is_interactive else ""}
 {"   question: 'What do plants do with sunlight?'" if is_interactive else ""}
 {"   options: ['Make food', 'Sleep', 'Change color', 'Hide']" if is_interactive else ""}
 {"   correct_answer_index: 0" if is_interactive else ""}
 {"" if is_interactive else ""}
-{"✅ dialogue: 'Let's test what you learned!'" if is_interactive else ""}
-{"   question: 'Which fraction is bigger: 3/4 or 1/4?'" if is_interactive else ""}
+{"✅ dialogue: 'I cut this pizza into four slices. If I eat three, is that more or less than one slice?'" if is_interactive else ""}
+{"   question: 'Which fraction shows more pizza?'" if is_interactive else ""}
 {"   options: ['3/4', '1/4', 'They are equal', 'Neither']" if is_interactive else ""}
 {"   correct_answer_index: 0" if is_interactive else ""}
+
 
 ⚠️ CRITICAL VEO CONTENT POLICY - SAFETY REQUIREMENTS (MUST FOLLOW):
 
@@ -497,7 +626,7 @@ Return the complete scene JSON with all required fields.
 """
 
     response = client.models.generate_content(
-        model=GEMINI_3_MODEL,
+        model=GEMINI_MODEL,
         contents=expansion_prompt,
         config=types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(
@@ -560,19 +689,11 @@ def expand_all_scenes(
     return episode_plan
 
 
-# ------------------------------------------------------------------------------
-# Repair and Retry Logic
-# ------------------------------------------------------------------------------
-
 def repair_episode_with_gemini(
     client: genai.Client,
     episode_data: Dict[str, Any],
     validation_errors: List[str]
 ) -> Dict[str, Any]:
-    """
-    Use Gemini to repair a failed episode based on validation errors.
-    """
-    
     repair_prompt = f"""
 The following episode JSON has validation errors. Fix them and return a corrected version.
 
@@ -585,15 +706,14 @@ CURRENT EPISODE JSON:
 REQUIREMENTS:
 - Exactly 8 scenes
 - Only scenes 2, 4, 6 should have "interaction": true
-- Interactive scenes MUST have: interaction_type, question, options (array of 4), correct_answer_index, correct_feedback_url, incorrect_feedback_url, idle_url
+- Interactive scenes MUST have: interaction_type, question, options (array of 4), correct_answer_index
 - Non-interactive scenes MUST NOT have those fields
 - All scenes must have: scene_number, interaction, video_url, prompt, dialogue
 
 Return the corrected episode JSON.
 """
-
     response = client.models.generate_content(
-        model=GEMINI_3_MODEL,
+        model=GEMINI_MODEL,
         contents=repair_prompt,
         config=types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(
@@ -603,224 +723,157 @@ Return the corrected episode JSON.
             response_mime_type="application/json",
         ),
     )
-    
-    repaired_episode = json.loads(response.text)
-    return repaired_episode
+    return json.loads(response.text)
 
 
-def generate_episode(
+# ---------------------------------------------------------------------------
+# Main Pipeline
+# ---------------------------------------------------------------------------
+
+def generate_episode_json(
     episode_topic: str,
     story_style: str,
     character_image_base64: Optional[str] = None,
-    character_description: Optional[str] = None
+    character_description: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Main pipeline: Generate a complete episode using Gemini 3 Pro with thinking levels.
-    
-    Args:
-        episode_topic: The educational topic/theme for the episode
-        story_style: Selected story style (e.g., "high-quality", "claymation")
-        character_image_base64: Optional base64-encoded character image
-        character_description: Optional text description of character
-    
-    Returns:
-        Complete validated episode JSON
-    
-    Raises:
-        ValueError: If episode generation fails after max retries
-    """
-    
+    """Generate a validated episode JSON using Gemini (no videos yet)."""
     client = get_gemini_client()
-    
-    # Phase A: Generate episode plan with HIGH thinking
-    print("[Phase A] Generating episode plan with HIGH thinking...")
+
+    print("[Phase A] Generating episode plan with Gemini...")
     episode_plan = generate_episode_plan(
         client=client,
         episode_topic=episode_topic,
         story_style=story_style,
-        character_description=character_description
+        character_description=character_description,
     )
-    
-    # Phase B: Expand scenes with mixed thinking levels
-    print("[Phase B] Expanding scenes with mixed thinking levels...")
+
+    print("[Phase B] Expanding scenes...")
     complete_episode = expand_all_scenes(client, episode_plan)
-    
-    # Validation and retry loop
+
     for attempt in range(MAX_VALIDATION_RETRIES):
         print(f"[Validation] Attempt {attempt + 1}/{MAX_VALIDATION_RETRIES}")
-        
         is_valid, errors = validate_episode_schema(complete_episode)
-        
         if is_valid:
-            print("[Success] Episode validated successfully!")
+            print("[Validation] Episode valid!")
             return complete_episode
-        
-        print(f"[Validation Failed] Errors: {errors}")
-        
+        print(f"[Validation] Errors: {errors}")
         if attempt < MAX_VALIDATION_RETRIES - 1:
-            print("[Repair] Attempting to repair episode...")
-            complete_episode = repair_episode_with_gemini(
-                client=client,
-                episode_data=complete_episode,
-                validation_errors=errors
-            )
+            complete_episode = repair_episode_with_gemini(client, complete_episode, errors)
         else:
-            raise ValueError(
-                f"Episode generation failed after {MAX_VALIDATION_RETRIES} attempts. "
-                f"Final errors: {errors}"
-            )
-    
-    raise ValueError("Episode generation failed - should not reach here")
+            raise ValueError(f"Episode generation failed after {MAX_VALIDATION_RETRIES} attempts. Errors: {errors}")
 
-
-def convert_episode_to_veo_request(
-    episode_data: Dict[str, Any],
-    character_image_base64: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Convert Gemini-generated episode JSON to Veo generation request format.
-    
-    Args:
-        episode_data: Complete episode JSON from Gemini
-        character_image_base64: Optional character reference image
-    
-    Returns:
-        Request payload for Veo generation endpoint
-    """
-    
-    veo_scenes = []
-    
-    for scene in episode_data["scenes"]:
-        veo_scene = {
-            "prompt": scene["prompt"],
-            "dialogue": scene.get("dialogue"),
-            "interaction": scene.get("interaction", False)
-        }
-        
-        # Add interaction-specific fields for interactive scenes (MCQ format)
-        if scene.get("interaction"):
-            veo_scene["question"] = scene.get("question")
-            veo_scene["options"] = scene.get("options", [])
-            veo_scene["correct_answer_index"] = scene.get("correct_answer_index")
-            veo_scene["interaction_type"] = scene.get("interaction_type", "quiz")
-        
-        veo_scenes.append(veo_scene)
-    
-    veo_request = {
-        "scenes": veo_scenes,
-        "duration_seconds": 8,
-        "aspect_ratio": "16:9",
-        "generate_audio": True
-    }
-    
-    # Add character reference image if provided
-    if character_image_base64:
-        veo_request["style_reference_image_base64"] = character_image_base64
-    
-    return veo_request
-
-
-def generate_videos_for_episode(
-    episode_data: Dict[str, Any],
-    character_image_base64: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Trigger Veo video generation for the episode and return complete episode with video URLs.
-    
-    Args:
-        episode_data: Validated episode JSON from Gemini
-        character_image_base64: Optional character reference image
-    
-    Returns:
-        Complete episode with actual video URLs from Veo
-    """
-    
-    print("[Veo Generation] Converting episode to Veo request format...")
-    veo_request = convert_episode_to_veo_request(episode_data, character_image_base64)
-    
-    print(f"[Veo Generation] Sending request to Veo endpoint: {VEO_GENERATION_ENDPOINT}")
-    print(f"[Veo Generation] Generating {len(veo_request['scenes'])} scenes...")
-    print(f"[Veo Generation] Calling Veo service at: {VEO_GENERATION_ENDPOINT}")
-    
-    # Call the Veo generation endpoint
-    # Note: This runs in a background task, so the long timeout is fine
-    response = requests.post(
-        VEO_GENERATION_ENDPOINT,
-        json=veo_request,
-        timeout=7200  # 2 hour timeout for video generation
-    )
-    
-    if response.status_code != 200:
-        raise ValueError(
-            f"Veo generation failed with status {response.status_code}: {response.text}"
-        )
-    
-    veo_response = response.json()
-    
-    print("[Veo Generation] Successfully generated all videos!")
-    print(f"[Veo Generation] Stitched video URL: {veo_response.get('stitched_video_url')[:100]}...")
-    
-    # Update episode with actual video URLs from Veo
-    for i, scene in enumerate(episode_data["scenes"]):
-        # Update main scene video URL
-        scene["video_url"] = veo_response["scene_video_urls"][i]
-        
-        # Update feedback and idle URLs for interactive scenes
-        if scene.get("interaction"):
-            feedback_urls = veo_response["scene_feedback_urls"][i]
-            if feedback_urls:
-                scene["correct_feedback_url"] = feedback_urls["correct_url"]
-                scene["incorrect_feedback_url"] = feedback_urls["incorrect_url"]
-            
-            idle_url = veo_response["scene_idle_urls"][i]
-            if idle_url:
-                scene["idle_url"] = idle_url
-    
-    # Add stitched video URL to episode metadata
-    episode_data["stitched_video_url"] = veo_response["stitched_video_url"]
-    
-    return episode_data
+    raise ValueError("Episode generation failed unexpectedly")
 
 
 def generate_complete_episode(
     episode_topic: str,
     story_style: str,
     character_image_base64: Optional[str] = None,
-    character_description: Optional[str] = None
+    character_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Complete pipeline: Generate episode JSON with Gemini, then generate videos with Veo.
-    
-    This is the main entry point for Create Your Own Episode.
-    
-    Args:
-        episode_topic: The educational topic/theme for the episode
-        story_style: Selected story style
-        character_image_base64: Optional base64-encoded character image
-        character_description: Optional text description of character
-    
-    Returns:
-        Complete episode with actual video URLs, ready to play
+    Full pipeline: Gemini JSON → Veo videos → complete episode with signed URLs.
+    This is the main entry point called from main.py background task.
     """
-    
-    # Step 1: Generate episode JSON with Gemini 3 Pro
-    print("[Pipeline] Step 1: Generating episode JSON with Gemini 3 Pro...")
-    episode_data = generate_episode(
+    if os.environ.get("MOCK_MODE", "false").lower() == "true":
+        print("[Pipeline] Running in MOCK_MODE: Skipping Vertex AI calls")
+        time.sleep(3) # Simulate some processing time
+        
+        episode_id = f"ep_mock_{int(time.time())}"
+        
+        
+        mock_episode = {
+            "episode_id": episode_id,
+            "title": f"Coco’s Nature Lab: The Secret of the Tiny Seed",
+            "description": f"A mock episode about {episode_topic} for frontend testing.",
+            "skills": ["Testing", "Frontend"],
+            "character_name": character_name or "Character",
+            "scenes": [
+                 {
+                    "scene_number": 1,
+                    "interaction": False,
+                    "video_url": "http://localhost:3000/test/scene1.mp4",
+                    "prompt": "Mock prompt scene 1",
+                    "dialogue": "Wow! Look at this tiny seed. It wants to grow into a big strong plant."
+                },
+                {
+                    "scene_number": 2,
+                    "interaction": True,
+                    "interaction_type": "quiz",
+                    "video_url": "http://localhost:3000/test/scene2.mp4",
+                    "prompt": "Mock prompt scene 2",
+                    "dialogue": "To grow big and strong, this little seed needs a cozy bed. Where should we plant it?",
+                    "question": "Where should we plant the seed?",
+                    "options": ["In the dark soil", "On a cold rock", "In a toy box", "Under a pillow"],
+                    "correct_answer_index": 0
+                },
+                {
+                    "scene_number": 3,
+                    "interaction": False,
+                    "video_url": "http://localhost:3000/test/scene3.mp4",
+                    "prompt": "Great job! Now our seed is thirsty. It needs a big drink to wake up",
+                    "dialogue": "Great job! Now our seed is thirsty. It needs a big drink to wake up"
+                },
+                {
+                    "scene_number": 4,
+                    "interaction": True,
+                    "interaction_type": "quiz",
+                    "video_url": "http://localhost:3000/test/scene4.mp4",
+                    "prompt": "Mock prompt scene 4",
+                    "dialogue": "Seeds are thirsty. They need water to wake up and grow. Can you tell me what brings water to the garden",
+                    "question": "What brings water to the garden?",
+                    "options": ["Sun", "Rain", "Wind", "Snow"],
+                    "correct_answer_index": 1
+                },
+                {
+                    "scene_number": 5,
+                    "interaction": False,
+                    "video_url": "http://localhost:3000/test/scene5.mp4",
+                    "prompt": "Mock prompt scene 5",
+                    "dialogue": "Look! A tiny green sprout popped out. It's reaching out for the warm sun."
+                },
+                {
+                    "scene_number": 6,
+                    "interaction": True,
+                    "interaction_type": "quiz",
+                    "video_url": "http://localhost:3000/test/scene6.mp4",
+                    "prompt": "Mock prompt scene 6",
+                    "dialogue": "To make food and turn green, our plant needs something bright and warm from the sky. Can you guess what it is?",
+                    "question": "What does the plant need to make food and turn green?",
+                    "options": ["A flashlight", "A glowing bug","The bright sun", "A nightlight"],
+                    "correct_answer_index": 2
+                },
+                 {
+                    "scene_number": 7,
+                    "interaction": False,
+                    "video_url": "http://localhost:3000/test/scene7.mp4",
+                    "prompt": "Mock prompt scene 7",
+                    "dialogue": "Wow, look at that! With soil, water, and sunshine, our tiny seed became a beautiful flower!"
+                },
+                {
+                    "scene_number": 8,
+                    "interaction": False,
+                    "video_url": "http://localhost:3000/test/scene8.mp4",
+                    "prompt": "Mock prompt scene 8",
+                    "dialogue": "We did it! Thanks for helping me grow this amazing plant today! Bye bye!"
+                }
+            ]
+        }
+        return mock_episode
+
+    print("[Pipeline] Step 1: Generating episode JSON with Gemini...")
+    episode_data = generate_episode_json(
         episode_topic=episode_topic,
         story_style=story_style,
         character_image_base64=character_image_base64,
-        character_description=character_description
+        character_description=character_name,
     )
-    
-    print(f"[Pipeline] Episode JSON generated: {episode_data['episode_id']}")
-    
-    # Step 2: Generate videos with Veo
+    print(f"[Pipeline] Episode JSON: {episode_data.get('episode_id')}")
+
     print("[Pipeline] Step 2: Generating videos with Veo...")
     complete_episode = generate_videos_for_episode(
         episode_data=episode_data,
-        character_image_base64=character_image_base64
+        character_image_base64=character_image_base64,
     )
-    
-    print(f"[Pipeline] Complete! Episode ready: {complete_episode['episode_id']}")
-    
+    print(f"[Pipeline] Complete! Episode ready: {complete_episode.get('episode_id')}")
     return complete_episode

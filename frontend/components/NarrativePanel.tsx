@@ -5,7 +5,6 @@ import type { Scene } from './StoryBook';
 
 interface NarrativePanelProps {
     scene: Scene;
-    chapterNumber: number;
     character: string;
     onFlip: () => void;
     canFlip: boolean;
@@ -15,7 +14,6 @@ interface NarrativePanelProps {
 
 export default function NarrativePanel({
     scene,
-    chapterNumber,
     character,
     onFlip,
     canFlip,

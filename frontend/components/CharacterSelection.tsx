@@ -11,7 +11,7 @@ import FoxImg from '../assets/Fox.jpg';
 import SheepImg from '../assets/Sheep.png';
 
 interface CharacterSelectionProps {
-  onCreateStorybook: (character: string, subject: string) => void;
+  onCreateStorybook: (character: string, subject: string, episodeId: string) => void;
 }
 
 const CHARACTERS = [
@@ -82,10 +82,46 @@ export default function CharacterSelection({ onCreateStorybook }: CharacterSelec
     }
 
     setIsLoading(true);
-    setTimeout(() => {
-      onCreateStorybook(selectedCharacter.name, topicText.trim());
+    try {
+      // Convert character image to base64
+      const response = await fetch(selectedCharacter.img.src);
+      const blob = await response.blob();
+      const base64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const result = reader.result as string;
+          // Strip the data:*/*;base64, prefix
+          resolve(result.split(',')[1] ?? '');
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+
+      const formData = new FormData();
+      formData.append('episode_topic', topicText.trim());
+      formData.append('story_style', 'high-quality');
+      formData.append('character_name', selectedCharacter.name);
+      formData.append('character_image_base64', base64);
+
+      const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
+      const res = await fetch(`${baseUrl}/generate-episode`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await res.json();
+
+      if (data.success && data.episode?.episode_id) {
+        onCreateStorybook(selectedCharacter.name, topicText.trim(), data.episode.episode_id);
+      } else {
+        alert(data.error || 'Failed to start episode generation. Please try again.');
+      }
+    } catch (err) {
+      console.error('[CharacterSelection] Error calling backend:', err);
+      alert('Could not connect to the backend. Make sure it is running on http://localhost:8000');
+    } finally {
       setIsLoading(false);
-    }, 500);
+    }
   };
 
   return (
