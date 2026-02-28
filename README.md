@@ -31,7 +31,7 @@ Traditional textbooks and static learning materials leave millions of children b
 
 ## ✨ Our Solution
 
-**TaleBuddyk** transforms studying into a **cinematic, interactive adventure**. Parents and children together:
+**TaleBuddy** transforms studying into a **cinematic, interactive adventure**. Parents and children together:
 1. **Create a custom character** with a unique name
 2. **Choose a topic** they want to learn (e.g., Photosynthesis, Fractions, The Solar System)
 3. **Select a story style** that excites them (Fantasy, Space Adventure, Jungle Explorer...)
@@ -61,7 +61,7 @@ Without AI, this platform would be a **static video player**. With AI:
 ---
 
 ## 🏗️ Architecture
-![](docs\System_Architecture_Diagram.png)
+![](docs/System_Architecture_Diagram.png)
 
 
 ### Generation Pipeline
